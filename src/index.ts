@@ -9,6 +9,14 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import {
+  chunkText,
+  rankAndPickTop,
+  summarizeChunks,
+  extractCitations,
+  TextChunk,
+  RAGResult
+} from "./rag-utils.js";
 
 const ClinicalTrialSearchParamsSchema = z.object({
   condition: z.string().optional(),
@@ -34,6 +42,20 @@ const AdverseEventComparisonParamsSchema = z.object({
 });
 
 type AdverseEventComparisonParams = z.infer<typeof AdverseEventComparisonParamsSchema>;
+
+const AEPipelineRAGParamsSchema = z.object({
+  query: z.string().optional(),
+  drug: z.string().optional(),
+  condition: z.string().optional(),
+  top_k: z.coerce.number().int().min(1).max(10).optional().default(5),
+  filters: z.object({
+    status: z.string().optional().default("COMPLETED"),
+    limit: z.coerce.number().int().min(1).max(100).optional().default(50),
+    include_completed_only: z.boolean().optional().default(true)
+  }).optional().default({})
+});
+
+type AEPipelineRAGParams = z.infer<typeof AEPipelineRAGParamsSchema>;
 
 interface ClinicalTrialsResponse {
   studies: any[];
@@ -173,6 +195,57 @@ class ClinicalTrialsServer {
           }
         },
         {
+          name: "ae_pipeline_rag",
+          description: "Advanced RAG pipeline for adverse events analysis. Fetches, extracts, chunks, retrieves and summarizes clinical trial data in one call to prevent LLM response truncation.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: {
+                type: "string",
+                description: "Natural language query about adverse events. Example: 'gastrointestinal bleeding risk vs placebo'"
+              },
+              drug: {
+                type: "string",
+                description: "Drug name to focus the analysis on. Example: 'Vemurafenib'"
+              },
+              condition: {
+                type: "string",
+                description: "Medical condition context. Example: 'melanoma', 'cancer'"
+              },
+              top_k: {
+                type: "number",
+                description: "Number of most relevant text chunks to return (1-10)",
+                default: 5,
+                minimum: 1,
+                maximum: 10
+              },
+              filters: {
+                type: "object",
+                description: "Additional filters for data retrieval",
+                properties: {
+                  status: {
+                    type: "string",
+                    description: "Study status filter",
+                    default: "COMPLETED"
+                  },
+                  limit: {
+                    type: "number",
+                    description: "Maximum studies to fetch",
+                    default: 50,
+                    minimum: 1,
+                    maximum: 100
+                  },
+                  include_completed_only: {
+                    type: "boolean",
+                    description: "Only include completed studies with results",
+                    default: true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
           name: "analyze_safety_profile",
           description: "Analyze safety profile of a drug by extracting and comparing adverse events data across multiple clinical trials. Provides risk assessment and dose-response relationships.",
           inputSchema: {
@@ -245,6 +318,10 @@ class ClinicalTrialsServer {
           case "compare_adverse_events":
             const adverseParams = AdverseEventComparisonParamsSchema.parse(args);
             return await this.compareAdverseEvents(adverseParams);
+          
+          case "ae_pipeline_rag":
+            const ragParams = AEPipelineRAGParamsSchema.parse(args);
+            return await this.aePipelineRag(ragParams);
           
           case "analyze_safety_profile":
             const safetyParams = {
@@ -626,6 +703,199 @@ class ClinicalTrialsServer {
       key_findings: "Adverse event comparison data extracted from clinical trials",
       recommendation: "Review individual study comparisons for detailed safety assessment"
     };
+  }
+
+  private async aePipelineRag(params: AEPipelineRAGParams): Promise<{ content: Array<{ type: string; text: string }> }> {
+    try {
+      // 1. 构建搜索参数
+      const searchParams: ClinicalTrialSearchParams = {
+        pageSize: params.filters?.limit || 50,
+        countTotal: true
+      };
+
+      if (params.drug) searchParams.intervention = params.drug;
+      if (params.condition) searchParams.condition = params.condition;
+      if (params.filters?.status) searchParams.status = params.filters.status;
+      if (params.filters?.include_completed_only) {
+        searchParams.status = "COMPLETED";
+      }
+
+      // 2. 抓取数据
+      const data = await this.makeRequest(searchParams);
+      
+      if (!data.studies || data.studies.length === 0) {
+        const result: RAGResult = {
+          source: "clinicaltrials",
+          query: params.query,
+          drug: params.drug,
+          condition: params.condition,
+          top_chunks: [],
+          summary: "未找到匹配的临床试验数据。请尝试调整搜索条件。",
+          citations: []
+        };
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2)
+          }]
+        };
+      }
+
+      // 3. 提取和分块文本
+      const allChunks: TextChunk[] = [];
+      
+      for (const study of data.studies) {
+        const studyText = this.extractStudyText(study);
+        if (studyText.trim().length > 0) {
+          const nctId = study.protocolSection?.identificationModule?.nctId || 'unknown';
+          const title = study.protocolSection?.identificationModule?.briefTitle || 'Untitled Study';
+          
+          const chunks = chunkText(
+            studyText,
+            1000,
+            200,
+            nctId,
+            {
+              title,
+              type: 'clinical_trial',
+              hasResults: !!study.resultsSection,
+              hasAdverseEvents: !!study.resultsSection?.adverseEventsModule
+            }
+          );
+          
+          allChunks.push(...chunks);
+        }
+      }
+
+      // 4. 构建查询关键词
+      const queryText = [params.query, params.drug, params.condition]
+        .filter(Boolean)
+        .join(' ');
+      
+      const extraKeywords = [
+        'adverse events', 'side effects', 'safety', 'toxicity',
+        'placebo', 'control', 'comparison', 'risk',
+        '不良事件', '副作用', '安全性', '对照'
+      ];
+
+      // 5. 检索和排序
+      const topChunks = rankAndPickTop(
+        allChunks,
+        queryText,
+        params.top_k,
+        extraKeywords
+      );
+
+      // 6. 生成摘要
+      const summary = summarizeChunks(topChunks, {
+        source: 'clinicaltrials',
+        query: params.query,
+        drug: params.drug,
+        condition: params.condition,
+        maxLength: 1200
+      });
+
+      // 7. 提取引用
+      const citations = extractCitations(topChunks);
+
+      // 8. 构建结果
+      const result: RAGResult = {
+        source: "clinicaltrials",
+        query: params.query,
+        drug: params.drug,
+        condition: params.condition,
+        top_chunks: topChunks.map(chunk => ({
+          ...chunk,
+          text: chunk.text.length > 1200 ? chunk.text.slice(0, 1200) + '...' : chunk.text
+        })),
+        summary,
+        citations
+      };
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(result, null, 2)
+        }]
+      };
+      
+    } catch (error) {
+      console.error("Error in ae_pipeline_rag:", error);
+      throw new McpError(
+        ErrorCode.InternalError,
+        `RAG pipeline failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private extractStudyText(study: any): string {
+    const textParts: string[] = [];
+    
+    // 基本信息
+    const identification = study.protocolSection?.identificationModule;
+    if (identification) {
+      if (identification.nctId) textParts.push(`NCT ID: ${identification.nctId}`);
+      if (identification.briefTitle) textParts.push(`Title: ${identification.briefTitle}`);
+      if (identification.officialTitle) textParts.push(`Official Title: ${identification.officialTitle}`);
+    }
+    
+    // 描述信息
+    const description = study.protocolSection?.descriptionModule;
+    if (description) {
+      if (description.briefSummary) textParts.push(`Summary: ${description.briefSummary}`);
+      if (description.detailedDescription) textParts.push(`Description: ${description.detailedDescription}`);
+    }
+    
+    // 干预措施
+    const interventions = study.protocolSection?.armsInterventionsModule?.interventions;
+    if (interventions) {
+      interventions.forEach((intervention: any, idx: number) => {
+        textParts.push(`Intervention ${idx + 1}: ${intervention.name || 'Unknown'}`);
+        if (intervention.description) textParts.push(`Description: ${intervention.description}`);
+      });
+    }
+    
+    // 不良事件（重点）
+    const adverseEvents = study.resultsSection?.adverseEventsModule;
+    if (adverseEvents) {
+      textParts.push("=== ADVERSE EVENTS SECTION ===");
+      
+      // 严重不良事件
+      if (adverseEvents.seriousEvents) {
+        textParts.push("Serious Adverse Events:");
+        adverseEvents.seriousEvents.forEach((event: any, idx: number) => {
+          textParts.push(`${idx + 1}. ${event.term || 'Unknown event'}`);
+          if (event.assessment) textParts.push(`Assessment: ${event.assessment}`);
+          if (event.stats) {
+            event.stats.forEach((stat: any) => {
+              textParts.push(`Stats: ${JSON.stringify(stat)}`);
+            });
+          }
+        });
+      }
+      
+      // 其他不良事件
+      if (adverseEvents.otherEvents) {
+        textParts.push("Other Adverse Events:");
+        adverseEvents.otherEvents.forEach((event: any, idx: number) => {
+          textParts.push(`${idx + 1}. ${event.term || 'Unknown event'}`);
+          if (event.assessment) textParts.push(`Assessment: ${event.assessment}`);
+        });
+      }
+    }
+    
+    // 结果概述
+    const outcomes = study.resultsSection?.outcomeMeasuresModule?.outcomeMeasures;
+    if (outcomes) {
+      textParts.push("=== OUTCOMES SECTION ===");
+      outcomes.slice(0, 3).forEach((outcome: any, idx: number) => {
+        if (outcome.title) textParts.push(`Outcome ${idx + 1}: ${outcome.title}`);
+        if (outcome.description) textParts.push(`Description: ${outcome.description}`);
+      });
+    }
+    
+    return textParts.join('\n\n');
   }
 
   async run() {
