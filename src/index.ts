@@ -33,6 +33,11 @@ const AdverseEventComparisonParamsSchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).optional().default(10),
 });
 
+const StudyDetailParamsSchema = z.object({
+  nct_id: z.string(),
+  fields: z.array(z.string()).optional(),
+});
+
 type AdverseEventComparisonParams = z.infer<typeof AdverseEventComparisonParamsSchema>;
 
 interface ClinicalTrialsResponse {
@@ -201,6 +206,28 @@ class ClinicalTrialsServer {
             },
             required: ["drug_name"]
           }
+        },
+        {
+          name: "get_complete_study_details",
+          description: "Get complete, untruncated information for a specific clinical trial using its NCT ID. Use this when you need full study details.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              nct_id: {
+                type: "string",
+                description: "NCT ID of the study (obtained from search results)"
+              },
+              fields: {
+                type: "array",
+                items: {
+                  type: "string"
+                },
+                description: "Optional: Specific sections to return. If not provided, returns key sections only. Available: protocolSection, resultsSection, documentSection, derivedSection",
+                default: []
+              }
+            },
+            required: ["nct_id"]
+          }
         }
       ],
     }));
@@ -255,6 +282,10 @@ class ClinicalTrialsServer {
             };
             return await this.analyzeSafetyProfile(safetyParams);
           
+          case "get_complete_study_details":
+            const detailParams = StudyDetailParamsSchema.parse(args);
+            return await this.getCompleteStudyDetails(detailParams.nct_id, detailParams.fields);
+          
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -271,6 +302,55 @@ class ClinicalTrialsServer {
         );
       }
     });
+  }
+
+  // Helper method to truncate long text
+  private truncateText(text: string | string[], maxLength: number = 500): string {
+    if (!text) return "";
+    
+    const textStr = Array.isArray(text) ? text.join(" ") : text;
+    if (textStr.length <= maxLength) return textStr;
+    
+    return textStr.substring(0, maxLength) + "... [truncated]";
+  }
+
+  // Extract only key information from clinical trial data
+  private extractKeyStudyInfo(study: any) {
+    const protocol = study.protocolSection;
+    const identification = protocol?.identificationModule;
+    const description = protocol?.descriptionModule;
+    const eligibility = protocol?.eligibilityModule;
+    const design = protocol?.designModule;
+    const status = protocol?.statusModule;
+    
+    return {
+      // Basic study information
+      nct_id: identification?.nctId || "Unknown",
+      title: this.truncateText(identification?.briefTitle, 200),
+      status: status?.overallStatus || "Unknown",
+      phase: design?.phases?.[0] || "Unknown",
+      
+      // Key study details (truncated)
+      brief_summary: this.truncateText(description?.briefSummary, 300),
+      detailed_description: this.truncateText(description?.detailedDescription, 400),
+      primary_purpose: design?.primaryPurpose || "Unknown",
+      
+      // Eligibility (truncated)
+      eligibility_criteria: this.truncateText(eligibility?.eligibilityCriteria, 300),
+      minimum_age: eligibility?.minimumAge || "Unknown",
+      maximum_age: eligibility?.maximumAge || "Unknown",
+      
+      // Key dates
+      start_date: status?.startDateStruct?.date || "Unknown",
+      completion_date: status?.primaryCompletionDateStruct?.date || "Unknown",
+      
+      // Sponsor info
+      lead_sponsor: protocol?.sponsorCollaboratorsModule?.leadSponsor?.name || "Unknown",
+      
+      // Metadata for getting full details
+      has_results: !!study.resultsSection,
+      study_type: design?.studyType || "Unknown"
+    };
   }
 
   private async makeRequest(params: ClinicalTrialSearchParams): Promise<ClinicalTrialsResponse> {
@@ -334,15 +414,21 @@ class ClinicalTrialsServer {
   private async searchClinicalTrials(params: ClinicalTrialSearchParams) {
     const data = await this.makeRequest(params);
     
+    // Extract and summarize key information only
+    const summarizedStudies = data.studies?.map(study => this.extractKeyStudyInfo(study)) || [];
+    
     return {
       content: [
         {
           type: "text",
           text: JSON.stringify({
-            totalCount: data.totalCount,
-            nextPageToken: data.nextPageToken,
-            studies_count: data.studies?.length || 0,
-            studies: data.studies || []
+            meta: {
+              total_count: data.totalCount || 0,
+              returned_count: summarizedStudies.length,
+              next_page_token: data.nextPageToken
+            },
+            studies: summarizedStudies,
+            note: "Study information has been summarized. Use get_study_details with nct_id for complete information."
           }, null, 2)
         }
       ]
@@ -352,13 +438,69 @@ class ClinicalTrialsServer {
   private async getStudyDetails(nctId: string) {
     const data = await this.getStudyByNCT(nctId);
     
+    // Return summarized version by default
+    const summarizedData = this.extractKeyStudyInfo(data);
+    
     return {
       content: [
         {
           type: "text",
           text: JSON.stringify({
             nct_id: nctId,
-            study_details: data
+            study_summary: summarizedData,
+            note: "This is a summarized view. Use get_complete_study_details for full information."
+          }, null, 2)
+        }
+      ]
+    };
+  }
+
+  private async getCompleteStudyDetails(nctId: string, fields?: string[]) {
+    const data = await this.getStudyByNCT(nctId);
+    
+    if (!data) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "No study found with the specified NCT ID",
+              nct_id: nctId
+            }, null, 2)
+          }
+        ]
+      };
+    }
+
+    let responseData: any = {};
+
+    if (fields && fields.length > 0) {
+      // Return only requested sections
+      for (const field of fields) {
+        if ((data as any)[field]) {
+          responseData[field] = (data as any)[field];
+        }
+      }
+    } else {
+      // Return key sections with full content (no truncation)
+      responseData = {
+        nct_id: nctId,
+        protocol_section: data.protocolSection || {},
+        results_section: data.resultsSection || null,
+        has_results: !!data.resultsSection,
+        document_section: data.documentSection || null,
+        derived_section: data.derivedSection || null
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            nct_id: nctId,
+            complete_study_details: responseData,
+            note: "This is the complete, untruncated information for this clinical trial."
           }, null, 2)
         }
       ]
